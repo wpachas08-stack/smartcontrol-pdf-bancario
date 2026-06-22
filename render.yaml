@@ -4,10 +4,9 @@ services:
     env: python
     region: oregon
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: apt-get update -qq && apt-get install -y -qq qpdf && pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: API_KEY
-        generateValue: false
-        value: smartcontrol_2026_secret_CAMBIA_ESTO
+        value: sc_pdf_2026_smartcontrol
     healthCheckPath: /
