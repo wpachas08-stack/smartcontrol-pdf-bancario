@@ -11,12 +11,13 @@ class NacionPdfParser(BaseParser):
     Columnas: Fecha | Operación | Descripción | Débito | Crédito | Saldo
     """
 
-    def parsear(self, ruta: str) -> dict:
+    def parsear(self, ruta: str, password: str = None) -> dict:
         res = self.respuesta_vacia()
         movimientos = []
         errores = []
         try:
-            with pdfplumber.open(ruta) as pdf:
+            open_kwargs = {"password": password} if password else {}
+            with pdfplumber.open(ruta, **open_kwargs) as pdf:
                 texto_cab = ""
                 for i, page in enumerate(pdf.pages):
                     tablas = page.extract_tables()

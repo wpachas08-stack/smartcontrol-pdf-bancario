@@ -7,12 +7,13 @@ from parsers.base import BaseParser
 
 class GenericoPdfParser(BaseParser):
 
-    def parsear(self, ruta: str) -> dict:
+    def parsear(self, ruta: str, password: str = None) -> dict:
         res = self.respuesta_vacia()
         movimientos = []
         errores = ["Banco no detectado automáticamente. Usando parser genérico."]
         try:
-            with pdfplumber.open(ruta) as pdf:
+            open_kwargs = {"password": password} if password else {}
+            with pdfplumber.open(ruta, **open_kwargs) as pdf:
                 for page in pdf.pages:
                     tablas = page.extract_tables()
                     if tablas:
