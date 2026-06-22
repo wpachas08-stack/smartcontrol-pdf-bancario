@@ -7,7 +7,7 @@ import tempfile
 import os
 from pathlib import Path
 
-import pikepdf
+from pypdf import PdfReader, PdfWriter
 import pdfplumber
 
 
@@ -58,15 +58,13 @@ class ParserFactory:
     # ------------------------------------------------------------------
     def _desencriptar(self, ruta: str, password: str):
         """
-        Intenta abrir el PDF. Si está encriptado lo desencripta con pikepdf.
+        Intenta abrir el PDF. Si está encriptado lo desencripta con pypdf.
         Retorna (ruta_trabajo, ruta_temporal_o_None).
         """
         try:
-            pdf = pikepdf.open(ruta)
-            pdf.close()
-            return ruta, None  # No está encriptado
-        except pikepdf.PasswordError:
-            pass  # Necesita contraseña
+            reader = PdfReader(ruta)
+            if not reader.is_encrypted:
+                return ruta, None  # No está encriptado
         except Exception:
             return ruta, None
 
@@ -75,15 +73,26 @@ class ParserFactory:
         os.close(fd)
 
         try:
-            with pikepdf.open(ruta, password=password) as pdf:
-                pdf.save(ruta_dec)
+            reader = PdfReader(ruta)
+            result = reader.decrypt(password)
+            if result == 0:
+                os.unlink(ruta_dec)
+                raise ValueError(
+                    f"Contraseña incorrecta. El RUC '{password}' no abre este PDF. "
+                    "Verifique que el RUC de la empresa coincide con el del estado de cuenta."
+                )
+            writer = PdfWriter()
+            for page in reader.pages:
+                writer.add_page(page)
+            with open(ruta_dec, 'wb') as f:
+                writer.write(f)
             return ruta_dec, ruta_dec
-        except pikepdf.PasswordError:
-            os.unlink(ruta_dec)
-            raise ValueError(
-                f"Contraseña incorrecta. El RUC '{password}' no abre este PDF. "
-                "Verifique que el RUC de la empresa coincide con el del estado de cuenta."
-            )
+        except ValueError:
+            raise
+        except Exception as e:
+            if os.path.exists(ruta_dec):
+                os.unlink(ruta_dec)
+            raise ValueError(f"Error al desencriptar PDF: {str(e)}")
 
     # ------------------------------------------------------------------
     # Detección de banco
