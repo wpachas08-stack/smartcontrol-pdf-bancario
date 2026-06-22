@@ -105,3 +105,56 @@ async def procesar(
             os.unlink(ruta_tmp)
         except Exception:
             pass
+
+
+from fastapi import Body
+from pydantic import BaseModel
+
+class ProcesarBase64Request(BaseModel):
+    archivo_base64: str
+    extension: str
+    ruc: str
+    banco: str = ""
+
+@app.post("/procesar-base64")
+async def procesar_base64(
+    payload: ProcesarBase64Request,
+    _key: str = Security(verificar_api_key),
+):
+    """
+    Procesa un archivo enviado en base64 (evita corrupción en multipart).
+    """
+    import base64 as b64
+    
+    extension = payload.extension.lower().lstrip(".")
+    if extension not in ("pdf", "xlsx", "xls", "csv"):
+        raise HTTPException(status_code=400, detail=f"Extensión no permitida: {extension}")
+
+    try:
+        contenido = b64.b64decode(payload.archivo_base64)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Base64 inválido: {str(e)}")
+
+    if len(contenido) == 0:
+        raise HTTPException(status_code=400, detail="El archivo está vacío")
+
+    with tempfile.NamedTemporaryFile(
+        suffix=f".{extension}", delete=False, prefix="bco_"
+    ) as tmp:
+        tmp.write(contenido)
+        ruta_tmp = tmp.name
+
+    try:
+        factory   = ParserFactory()
+        resultado = factory.procesar(ruta_tmp, extension, payload.ruc.strip(), payload.banco.strip())
+        return JSONResponse(content=resultado)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        tb = traceback.format_exc()
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n{tb}")
+    finally:
+        try:
+            os.unlink(ruta_tmp)
+        except Exception:
+            pass
