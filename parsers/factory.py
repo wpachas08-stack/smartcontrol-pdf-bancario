@@ -44,7 +44,8 @@ class ParserFactory:
                     self._detectar_banco(ruta_trabajo, extension)
 
             parser = self._get_parser(banco, extension)
-            result = parser.parsear(ruta_trabajo)
+            # Pasar password original para que pdfplumber intente con contraseña
+            result = parser.parsear(ruta_trabajo, password=password if extension == 'pdf' else None)
             result["ok"]    = True
             result["banco"] = banco
             return result
@@ -58,41 +59,64 @@ class ParserFactory:
     # ------------------------------------------------------------------
     def _desencriptar(self, ruta: str, password: str):
         """
-        Intenta abrir el PDF. Si está encriptado lo desencripta con pypdf.
-        Retorna (ruta_trabajo, ruta_temporal_o_None).
+        Desencripta PDF protegido. BCP usa AES-256 con RUC como contraseña.
+        Usa pypdf para desencriptar y guardar copia limpia.
         """
+        # Primero verificar si está encriptado
         try:
-            reader = PdfReader(ruta)
-            if not reader.is_encrypted:
-                return ruta, None  # No está encriptado
+            with pdfplumber.open(ruta) as pdf:
+                _ = pdf.pages[0].extract_text()
+            return ruta, None  # No encriptado, se abre directo
         except Exception:
-            return ruta, None
+            pass  # Puede estar encriptado, continuar
 
-        # Desencriptar con contraseña (RUC)
+        # Intentar desencriptar con pypdf
         fd, ruta_dec = tempfile.mkstemp(suffix=".pdf", prefix="dec_")
         os.close(fd)
 
+        # Intentar con contraseña como string y como bytes
+        passwords = [password, password.encode('utf-8'), password.encode('latin-1')]
+        
+        for pwd in passwords:
+            try:
+                reader = PdfReader(ruta)
+                if not reader.is_encrypted:
+                    return ruta, None
+                result = reader.decrypt(pwd)
+                if result.name != 'NOT_DECRYPTED':
+                    writer = PdfWriter()
+                    for page in reader.pages:
+                        writer.add_page(page)
+                    with open(ruta_dec, 'wb') as f:
+                        writer.write(f)
+                    # Verificar que el resultado es legible
+                    try:
+                        with pdfplumber.open(ruta_dec) as pdf:
+                            _ = pdf.pages[0].extract_text()
+                        return ruta_dec, ruta_dec
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        # Si pypdf falla, intentar con pdfplumber directamente con password
         try:
-            reader = PdfReader(ruta)
-            result = reader.decrypt(password)
-            if result == 0:
-                os.unlink(ruta_dec)
-                raise ValueError(
-                    f"Contraseña incorrecta. El RUC '{password}' no abre este PDF. "
-                    "Verifique que el RUC de la empresa coincide con el del estado de cuenta."
-                )
-            writer = PdfWriter()
-            for page in reader.pages:
-                writer.add_page(page)
-            with open(ruta_dec, 'wb') as f:
-                writer.write(f)
-            return ruta_dec, ruta_dec
-        except ValueError:
-            raise
-        except Exception as e:
-            if os.path.exists(ruta_dec):
-                os.unlink(ruta_dec)
-            raise ValueError(f"Error al desencriptar PDF: {str(e)}")
+            with pdfplumber.open(ruta, password=password) as pdf:
+                # Es legible con contraseña — guardar páginas como texto
+                # pdfplumber puede leer directamente con password sin desencriptar a disco
+                pass
+            # Retornar ruta original con flag de password
+            os.unlink(ruta_dec)
+            return ruta, None  # pdfplumber manejará la password en el parser
+        except Exception:
+            pass
+
+        if os.path.exists(ruta_dec):
+            os.unlink(ruta_dec)
+        raise ValueError(
+            f"No se pudo desencriptar el PDF con RUC '{password}'. "
+            "Verifique que el RUC coincide con el propietario del estado de cuenta."
+        )
 
     # ------------------------------------------------------------------
     # Detección de banco

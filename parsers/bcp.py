@@ -15,13 +15,16 @@ from parsers.base import BaseParser
 
 class BcpPdfParser(BaseParser):
 
-    def parsear(self, ruta: str) -> dict:
+    def parsear(self, ruta: str, password: str = None) -> dict:
         res = self.respuesta_vacia()
         errores = []
         movimientos = []
 
         try:
-            with pdfplumber.open(ruta) as pdf:
+            open_kwargs = {}
+            if password:
+                open_kwargs['password'] = password
+            with pdfplumber.open(ruta, **open_kwargs) as pdf:
                 texto_cabecera = ""
                 todas_lineas   = []
 
