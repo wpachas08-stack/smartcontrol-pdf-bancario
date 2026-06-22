@@ -158,3 +158,63 @@ async def procesar_base64(
             os.unlink(ruta_tmp)
         except Exception:
             pass
+
+
+@app.post("/diagnostico")
+async def diagnostico(
+    payload: ProcesarBase64Request,
+    _key: str = Security(verificar_api_key),
+):
+    """Diagnóstico del PDF recibido."""
+    import base64 as b64
+    import hashlib
+    
+    try:
+        contenido = b64.b64decode(payload.archivo_base64)
+    except Exception as e:
+        return {"error": f"Base64 inválido: {str(e)}"}
+
+    info = {
+        "tamano_bytes": len(contenido),
+        "md5": hashlib.md5(contenido).hexdigest(),
+        "primeros_bytes": contenido[:20].hex(),
+        "es_pdf": contenido[:4] == b'%PDF',
+        "version_pdf": contenido[:8].decode('latin-1', errors='replace'),
+        "ruc_recibido": payload.ruc,
+        "extension": payload.extension,
+    }
+    
+    # Intentar abrir con pdfplumber
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(contenido)
+        ruta = tmp.name
+    
+    try:
+        # Sin password
+        with pdfplumber.open(ruta) as pdf:
+            info["pdfplumber_sin_password"] = f"OK - {len(pdf.pages)} páginas"
+    except Exception as e:
+        info["pdfplumber_sin_password"] = f"ERROR: {str(e)}"
+    
+    try:
+        # Con password = RUC
+        with pdfplumber.open(ruta, password=payload.ruc) as pdf:
+            info["pdfplumber_con_ruc"] = f"OK - {len(pdf.pages)} páginas"
+            texto = pdf.pages[0].extract_text() or ""
+            info["texto_pagina1"] = texto[:200]
+    except Exception as e:
+        info["pdfplumber_con_ruc"] = f"ERROR: {str(e)}"
+
+    # Intentar con pypdf
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(ruta)
+        info["pypdf_encriptado"] = reader.is_encrypted
+        if reader.is_encrypted:
+            result = reader.decrypt(payload.ruc)
+            info["pypdf_decrypt_result"] = str(result)
+    except Exception as e:
+        info["pypdf_error"] = str(e)
+    
+    os.unlink(ruta)
+    return info
