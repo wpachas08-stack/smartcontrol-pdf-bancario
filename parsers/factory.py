@@ -38,7 +38,15 @@ class ParserFactory:
 
         try:
             if extension == "pdf":
-                ruta_trabajo, ruta_dec_tmp = self._desencriptar(ruta, ruc)
+                # Primero intentar abrir directamente (PDF ya desbloqueado)
+                try:
+                    with pdfplumber.open(ruta) as pdf:
+                        _ = len(pdf.pages)
+                    ruta_trabajo  = ruta
+                    ruta_dec_tmp  = None
+                except Exception:
+                    # Si falla, intentar desencriptar
+                    ruta_trabajo, ruta_dec_tmp = self._desencriptar(ruta, ruc)
 
             banco = banco_forzado.lower() if banco_forzado else \
                     self._detectar_banco(ruta_trabajo, extension)
