@@ -44,8 +44,8 @@ class ParserFactory:
                     self._detectar_banco(ruta_trabajo, extension)
 
             parser = self._get_parser(banco, extension)
-            # Pasar password original para que pdfplumber intente con contraseña
-            result = parser.parsear(ruta_trabajo, password=password if extension == 'pdf' else None)
+            # Pasar ruc como password para que pdfplumber intente con contraseña
+            result = parser.parsear(ruta_trabajo, password=ruc if extension == 'pdf' else None)
             result["ok"]    = True
             result["banco"] = banco
             return result
