@@ -1,11 +1,13 @@
 """
-Parsers BCP (Banco de Crédito del Perú)
+Parser BCP (Banco de Crédito del Perú) — PDF y Excel
 
-PDF: Estado de cuenta mensual, puede estar encriptado con RUC como contraseña.
-     Formato tabular con columnas: Fecha | N°Op | Descripción | Cargo | Abono | Saldo
+Método de extracción PDF: agrupación de palabras por posición Y (coordenadas).
+Cada línea de movimiento tiene fecha en x≈45, cargo/abono y saldo al final.
 
-Excel: Columnas fijas desde fila ~8:
-     A=Fecha | B=N°Op | C=Descripción | D=Cargo | E=Abono | F=Saldo
+Formato por línea:
+  DD-MM  DESCRIPCION  [MED AT]  [LUGAR]  [NRO OP]  [HORA]  [ORIGEN] [TIPO]  MONTO  SALDO
+  Cargos: terminan en "-"  (ej: 50.00-)
+  Abonos: sin signo        (ej: 500.00)
 """
 import re
 import pdfplumber
@@ -16,41 +18,41 @@ from parsers.base import BaseParser
 class BcpPdfParser(BaseParser):
 
     def parsear(self, ruta: str, password: str = None) -> dict:
-        res = self.respuesta_vacia()
-        errores = []
+        res         = self.respuesta_vacia()
         movimientos = []
+        errores     = []
 
         try:
-            open_kwargs = {}
-            if password:
-                open_kwargs['password'] = password
+            open_kwargs = {"password": password} if password else {}
             with pdfplumber.open(ruta, **open_kwargs) as pdf:
+                anio = "2026"
                 texto_cabecera = ""
-                todas_lineas   = []
 
                 for i, page in enumerate(pdf.pages):
-                    # Intentar extracción por tabla primero (más precisa)
-                    tablas = page.extract_tables({
-                        "vertical_strategy":   "lines",
-                        "horizontal_strategy": "lines",
-                    })
+                    words = page.extract_words()
 
-                    if tablas:
-                        for tabla in tablas:
-                            for fila in tabla:
-                                if fila and any(fila):
-                                    todas_lineas.append(fila)
-                    else:
-                        # Fallback: texto plano con layout
-                        texto = page.extract_text(layout=True) or ""
-                        if i == 0:
-                            texto_cabecera = texto
-                        todas_lineas.extend(
-                            [{"_raw": linea} for linea in texto.splitlines()]
-                        )
+                    if i == 0:
+                        # Extraer cabecera de la primera página
+                        texto_cabecera = " ".join(w["text"] for w in words)
+                        cab = self._extraer_cabecera(texto_cabecera)
+                        res["cabecera"] = cab
+                        anio = cab.get("anio", "2026")
 
-                res["cabecera"] = self._extraer_cabecera_pdf(texto_cabecera or "")
-                movimientos     = self._procesar_lineas(todas_lineas)
+                    # Agrupar palabras por línea (coordenada Y redondeada)
+                    lineas = {}
+                    for w in words:
+                        y = round(w["top"] / 2) * 2
+                        if y not in lineas:
+                            lineas[y] = []
+                        lineas[y].append(w)
+
+                    # Procesar cada línea
+                    for y in sorted(lineas.keys()):
+                        palabras = sorted(lineas[y], key=lambda w: w["x0"])
+                        texto_linea = " ".join(w["text"] for w in palabras)
+                        mov = self._parsear_linea(texto_linea, anio)
+                        if mov:
+                            movimientos.append(mov)
 
         except Exception as e:
             errores.append(f"Error al leer PDF BCP: {str(e)}")
@@ -63,172 +65,103 @@ class BcpPdfParser(BaseParser):
         res["total_leidos"] = len(movimientos)
         return res
 
-    def _extraer_cabecera_pdf(self, texto: str) -> dict:
+    def _extraer_cabecera(self, texto: str) -> dict:
         cab = {
             "numero_cuenta": None,
             "periodo":       None,
             "saldo_inicial": None,
             "saldo_final":   None,
             "moneda":        "PEN",
+            "anio":          "2026",
         }
-        t = texto.upper()
 
-        # Número de cuenta
-        m = re.search(r'(?:CUENTA|CTA\.?)[:\s#]+(\d[\d\s\-]{6,20})', t)
+        # Número de cuenta BCP: 191-7365047-0-12
+        m = re.search(r'(\d{3}-\d{7}-\d-\d{2})', texto)
         if m:
-            cab["numero_cuenta"] = re.sub(r'[\s\-]', '', m.group(1))
+            cab["numero_cuenta"] = m.group(1)
 
-        # Período
-        m = re.search(r'(\d{2})[/\-](\d{4})', t)
+        # Período: DEL31/03/2026AL30/04/2026
+        m = re.search(r'DEL\s*\d{2}/\d{2}/(\d{4})\s*AL\s*\d{2}/(\d{2})/(\d{4})', texto)
         if m:
-            cab["periodo"] = m.group(2) + m.group(1).zfill(2)
+            cab["anio"]    = m.group(3)
+            cab["periodo"] = m.group(3) + m.group(2)  # AAAAMM
 
-        # Saldos
-        m = re.search(r'SALDO\s+INICIAL[^\d]+([\d,\.]+)', t)
+        # Saldo final del resumen
+        m = re.search(r'(\d{2}/\d{2}/\d{4})\s+([\d,\.]+)\s+[\d,\.]+\s+[\d,\.]+\s+[\d,\.]+\s+[\d,\.]+\s+[\d,\.]+\s+[\d,\.]+\s+([\d,\.]+)', texto)
         if m:
-            cab["saldo_inicial"] = self.parse_importe(m.group(1))
+            cab["saldo_inicial"] = self.parse_importe(m.group(2))
+            cab["saldo_final"]   = self.parse_importe(m.group(3))
 
-        m = re.search(r'SALDO\s+FINAL[^\d]+([\d,\.]+)', t)
-        if m:
-            cab["saldo_final"] = self.parse_importe(m.group(1))
-
-        # Moneda
-        if "DOLAR" in t or "USD" in t:
+        if "DOLAR" in texto.upper() or "USD" in texto.upper():
             cab["moneda"] = "USD"
 
         return cab
 
-    def _procesar_lineas(self, lineas: list) -> list:
+    def _parsear_linea(self, linea: str, anio: str) -> dict | None:
         """
-        Procesa líneas que pueden ser listas (de tabla) o dicts (de texto plano).
+        Parsea una línea de movimiento BCP.
+        Formato: DD-MM  DESCRIPCION ... MONTO  SALDO
+        Cargo:   el monto termina en "-"
+        Abono:   el monto no tiene signo
         """
-        movimientos = []
-        en_datos    = False
-
-        for linea in lineas:
-            # Caso 1: linea es una fila de tabla (lista)
-            if isinstance(linea, list):
-                # Detectar fila de cabecera de tabla
-                textos = [str(c or "").upper().strip() for c in linea]
-                if any("FECHA" in t for t in textos) and \
-                   any(t in ("CARGO", "CARGOS", "DÉBITOS", "DEBITOS") for t in textos):
-                    en_datos = True
-                    continue
-
-                if not en_datos:
-                    continue
-
-                # Detectar fin de tabla
-                fila_str = " ".join(textos)
-                if any(k in fila_str for k in ["SALDO FINAL", "TOTAL MOV", "* * *"]):
-                    break
-
-                mov = self._fila_tabla_a_mov(linea)
-                if mov:
-                    movimientos.append(mov)
-
-            # Caso 2: linea es dict con texto crudo
-            elif isinstance(linea, dict):
-                raw = linea.get("_raw", "")
-                raw_up = raw.upper()
-
-                if not en_datos:
-                    if re.search(r'FECHA.+CARGO.+ABONO', raw_up) or \
-                       re.search(r'FECHA.+DESCRIPCI', raw_up):
-                        en_datos = True
-                    continue
-
-                if any(k in raw_up for k in ["SALDO FINAL", "TOTAL MOV", "* * *"]):
-                    break
-
-                mov = self._linea_texto_a_mov(raw)
-                if mov:
-                    movimientos.append(mov)
-
-        return movimientos
-
-    def _fila_tabla_a_mov(self, fila: list) -> dict | None:
-        """Convierte una fila de tabla pdfplumber a movimiento."""
-        # Necesitamos al menos 4 columnas
-        cols = [str(c or "").strip() for c in fila]
-        while len(cols) < 6:
-            cols.append("")
-
-        fecha = self.parse_fecha(cols[0])
-        if not fecha:
-            return None
-
-        descripcion = cols[2] if len(cols) > 2 else cols[1]
-        cargo       = self.parse_importe(cols[3] if len(cols) > 3 else "")
-        abono       = self.parse_importe(cols[4] if len(cols) > 4 else "")
-        saldo       = self.parse_importe(cols[5] if len(cols) > 5 else "")
-        nro_op      = cols[1] if len(cols) > 1 else None
-
-        if cargo <= 0 and abono <= 0:
-            return None
-        if not descripcion or descripcion.upper() in ("CARGO", "ABONO", "FECHA"):
-            return None
-
-        tipo    = "cargo" if cargo > 0 else "abono"
-        importe = cargo if cargo > 0 else abono
-
-        return {
-            "fecha_operacion": fecha,
-            "fecha_valor":     fecha,
-            "referencia":      nro_op or None,
-            "descripcion":     descripcion,
-            "tipo":            tipo,
-            "importe":         importe,
-            "saldo_banco":     saldo or None,
-            "moneda":          "PEN",
-            "tipo_cambio":     1.0,
-        }
-
-    def _linea_texto_a_mov(self, linea: str) -> dict | None:
-        """Parsea una línea de texto plano BCP."""
-        # Debe comenzar con fecha DD/MM/YYYY
-        m = re.match(r'^(\d{2}/\d{2}/\d{4})\s+', linea)
+        # La línea debe empezar con DD-MM
+        m = re.match(r'^(\d{2})-(\d{2})\s+(.+)$', linea)
         if not m:
             return None
 
-        fecha = self.parse_fecha(m.group(1))
-        if not fecha:
+        dd   = m.group(1)
+        mm   = m.group(2)
+        rest = m.group(3).strip()
+
+        fecha = f"{anio}-{mm}-{dd}"
+
+        # Extraer los últimos 2 números de la línea (monto y saldo)
+        # Patrón: número con coma/punto, opcionalmente con "-" al final
+        nums = re.findall(r'((?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{2})?|\.\d{2})(-?)', rest)
+
+        if len(nums) < 1:
             return None
 
-        # Extraer todos los importes de la línea
-        importes = re.findall(r'([\d]{1,3}(?:[,\.]\d{3})*[,\.]\d{2})', linea)
-        if len(importes) < 2:
+        # Último par = saldo contable
+        saldo_val, _ = nums[-1]
+        saldo = self.parse_importe(saldo_val)
+
+        # Penúltimo par = monto del movimiento
+        if len(nums) >= 2:
+            monto_val, monto_sig = nums[-2]
+        else:
+            monto_val, monto_sig = nums[-1]
+            saldo = None
+
+        importe  = self.parse_importe(monto_val)
+        es_cargo = monto_sig == '-'
+
+        if importe <= 0:
             return None
 
-        saldo   = self.parse_importe(importes[-1])
-        importe1 = self.parse_importe(importes[-2]) if len(importes) >= 2 else 0
-        importe2 = self.parse_importe(importes[-3]) if len(importes) >= 3 else 0
+        # Extraer descripción: todo antes de los números finales
+        # Quitar números con guión del final
+        desc = re.sub(r'\s+(?:(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{2})?|\.\d{2})-?\s*(?:(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{2})?|\.\d{2})-?\s*$', '', rest)
+        desc = re.sub(r'\s+', ' ', desc).strip()
 
-        # Extraer descripción: todo entre la fecha+nro_op y los importes
-        sin_fecha = linea[m.end():]
-        # Quitar nro de operación (7-15 dígitos)
-        sin_nro = re.sub(r'^\d{7,15}\s+', '', sin_fecha)
-        # Quitar importes del final
-        desc_raw = re.sub(r'[\d,\.]+\s*$', '', sin_nro)
-        desc_raw = re.sub(r'[\d,\.]+\s+', '', desc_raw, count=2)
-        descripcion = " ".join(desc_raw.split())
+        # Quitar residuos numéricos del final de la descripción
+        desc = re.sub(r'\s+\d{4,}\s*$', '', desc).strip()
 
-        if not descripcion:
+        if not desc:
             return None
 
-        # Determinar cargo/abono por posición en la línea
-        # En BCP: columna CARGO viene antes que ABONO
-        mitad   = len(linea) // 2
-        pos_imp = linea.rfind(importes[-2]) if len(importes) >= 2 else 0
-        tipo    = "cargo" if pos_imp < mitad else "abono"
-        importe = importe1 if importe1 > 0 else importe2
+        # Extraer número de operación (6 dígitos aislados)
+        nro_op = None
+        m_nro  = re.search(r'\b(\d{6})\b', rest)
+        if m_nro:
+            nro_op = m_nro.group(1)
 
         return {
             "fecha_operacion": fecha,
             "fecha_valor":     fecha,
-            "referencia":      None,
-            "descripcion":     descripcion[:300],
-            "tipo":            tipo,
+            "referencia":      nro_op,
+            "descripcion":     desc[:300],
+            "tipo":            "cargo" if es_cargo else "abono",
             "importe":         importe,
             "saldo_banco":     saldo,
             "moneda":          "PEN",
@@ -237,89 +170,55 @@ class BcpPdfParser(BaseParser):
 
 
 class BcpExcelParser(BaseParser):
-    """
-    Parser BCP Excel.
-    BCP exporta con cabecera en filas 1-7, datos desde fila 8.
-    Columnas: A=Fecha | B=N°Op | C=Descripción | D=Cargo | E=Abono | F=Saldo
-    """
+    """Parser BCP Excel. Columnas: Fecha|NroOp|Desc|Cargo|Abono|Saldo"""
 
-    def parsear(self, ruta: str) -> dict:
-        res     = self.respuesta_vacia()
+    def parsear(self, ruta: str, password: str = None) -> dict:
+        res = self.respuesta_vacia()
+        movimientos = []
         errores = []
-
         try:
             wb = load_workbook(ruta, read_only=True, data_only=True)
             ws = wb.active
-
-            # Leer cabecera (filas 1-7)
             texto_cab = ""
             for row in ws.iter_rows(min_row=1, max_row=7, values_only=True):
                 texto_cab += " ".join(str(c or "") for c in row) + " "
-
             res["cabecera"] = self._extraer_cabecera_excel(texto_cab)
-
-            # Detectar fila de inicio de datos
             fila_inicio = self._detectar_fila_inicio(ws)
-
-            # Leer movimientos
-            movimientos = []
             for row in ws.iter_rows(min_row=fila_inicio, values_only=True):
                 fecha = self.parse_fecha(row[0] if row else None)
                 if not fecha:
                     continue
-
-                nro_op      = str(row[1] or "").strip() if len(row) > 1 else ""
-                descripcion = str(row[2] or "").strip() if len(row) > 2 else ""
-                cargo       = self.parse_importe(row[3] if len(row) > 3 else None)
-                abono       = self.parse_importe(row[4] if len(row) > 4 else None)
-                saldo       = self.parse_importe(row[5] if len(row) > 5 else None)
-
-                if cargo <= 0 and abono <= 0:
+                nro_op = str(row[1] or "").strip() if len(row) > 1 else ""
+                desc   = str(row[2] or "").strip() if len(row) > 2 else ""
+                cargo  = self.parse_importe(row[3] if len(row) > 3 else None)
+                abono  = self.parse_importe(row[4] if len(row) > 4 else None)
+                saldo  = self.parse_importe(row[5] if len(row) > 5 else None)
+                if cargo <= 0 and abono <= 0 or not desc:
                     continue
-                if not descripcion:
-                    continue
-
-                tipo    = "cargo" if cargo > 0 else "abono"
-                importe = cargo if cargo > 0 else abono
-
+                tipo = "cargo" if cargo > 0 else "abono"
                 movimientos.append({
-                    "fecha_operacion": fecha,
-                    "fecha_valor":     fecha,
-                    "referencia":      nro_op or None,
-                    "descripcion":     descripcion[:300],
-                    "tipo":            tipo,
-                    "importe":         importe,
-                    "saldo_banco":     saldo or None,
-                    "moneda":          res["cabecera"]["moneda"],
-                    "tipo_cambio":     1.0,
+                    "fecha_operacion": fecha, "fecha_valor": fecha,
+                    "referencia": nro_op or None, "descripcion": desc[:300],
+                    "tipo": tipo, "importe": round(cargo if cargo > 0 else abono, 2),
+                    "saldo_banco": saldo or None,
+                    "moneda": res["cabecera"]["moneda"], "tipo_cambio": 1.0,
                 })
-
             wb.close()
-
             if not res["cabecera"].get("periodo") and movimientos:
                 res["cabecera"]["periodo"] = self.periodo_desde_fechas(movimientos)
-
-            res["movimientos"]  = movimientos
+            res["movimientos"] = movimientos
             res["total_leidos"] = len(movimientos)
-
         except Exception as e:
-            errores.append(f"Error al leer Excel BCP: {str(e)}")
-
+            errores.append(f"Error Excel BCP: {str(e)}")
         res["errores"] = errores
         return res
 
     def _extraer_cabecera_excel(self, texto: str) -> dict:
         t = texto.upper()
-        cab = {
-            "numero_cuenta": None,
-            "periodo":       None,
-            "saldo_inicial": None,
-            "saldo_final":   None,
-            "moneda":        "PEN",
-        }
-        m = re.search(r'(?:CUENTA|CTA)[^\d]+([\d\s\-]{6,25})', t)
+        cab = {"numero_cuenta": None, "periodo": None, "saldo_inicial": None, "saldo_final": None, "moneda": "PEN"}
+        m = re.search(r'(\d{3}-\d{7}-\d-\d{2})', t)
         if m:
-            cab["numero_cuenta"] = re.sub(r'[\s\-]', '', m.group(1))[:20]
+            cab["numero_cuenta"] = m.group(1)
         m = re.search(r'(\d{2})[/\-](\d{4})', t)
         if m:
             cab["periodo"] = m.group(2) + m.group(1)
@@ -328,8 +227,7 @@ class BcpExcelParser(BaseParser):
         return cab
 
     def _detectar_fila_inicio(self, ws) -> int:
-        """Busca la primera fila que tenga una fecha válida en columna A."""
         for i, row in enumerate(ws.iter_rows(min_row=5, max_row=20, values_only=True), start=5):
             if row and self.parse_fecha(row[0]):
                 return i
-        return 9  # fallback BCP estándar
+        return 9
